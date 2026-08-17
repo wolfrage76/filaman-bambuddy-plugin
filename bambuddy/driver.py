@@ -49,10 +49,13 @@ from .profile_variants import (
     build_variant_groups_from_index,
     build_variant_index_from_presets,
     canonical_printer_model_token,
+    coerce_profile_base_name,
     expected_cloud_preset_name,
     extract_profile_base_name,
     filter_grouped_presets_for_model,
     group_presets_by_base_name,
+    infer_default_base_name,
+    is_cloud_setting_id,
     parse_cloud_preset_name,
     resolve_cloud_variant_detailed,
     resolve_cloud_variant_from_index,
@@ -1500,22 +1503,7 @@ class Driver(BaseDriver):
     def _infer_default_base_name(
         profiles: dict[str, dict[str, str]], stored_default: str = ""
     ) -> str:
-        if stored_default:
-            return stored_default.strip()
-        linked = [
-            e["base_name"]
-            for e in profiles.values()
-            if e.get("base_name") and e.get("source") != "override"
-        ]
-        if linked:
-            counts: dict[str, int] = {}
-            for name in linked:
-                counts[name] = counts.get(name, 0) + 1
-            return max(counts, key=counts.get)
-        for entry in profiles.values():
-            if entry.get("base_name"):
-                return entry["base_name"]
-        return ""
+        return infer_default_base_name(profiles, stored_default)
 
     async def _link_default_to_models(
         self,
@@ -2817,7 +2805,7 @@ class Driver(BaseDriver):
         self, filaman_spool_id: int, base_name: str
     ) -> None:
         """Store the logical profile base name (separate from bambu_slicer_filament code)."""
-        if not filaman_spool_id or not base_name:
+        if not filaman_spool_id or not base_name or is_cloud_setting_id(base_name):
             return
         try:
             async with async_session_maker() as db:
@@ -2837,7 +2825,7 @@ class Driver(BaseDriver):
     async def _upsert_filament_profile_base_name(
         self, filament_id: int, base_name: str
     ) -> None:
-        if not filament_id or not base_name:
+        if not filament_id or not base_name or is_cloud_setting_id(base_name):
             return
         try:
             async with async_session_maker() as db:
@@ -2858,7 +2846,7 @@ class Driver(BaseDriver):
         self, spool_id: int, code: str, name: str | None
     ) -> dict[str, Any]:
         """Resolve and store per-model PFUS variants; return coverage metadata for UI."""
-        base_name = _extract_profile_base_name(name or code)
+        base_name = coerce_profile_base_name(name, code)
         if not self._per_printer_profiles:
             await self._upsert_spool_bambu_slicer_setting_id(int(spool_id), code)
             peers = self._peer_printer_ids()
@@ -2932,7 +2920,7 @@ class Driver(BaseDriver):
         self, filament_id: int, code: str, name: str | None
     ) -> dict[str, Any]:
         """Resolve and store per-model PFUS defaults on a filament."""
-        base_name = _extract_profile_base_name(name or code)
+        base_name = coerce_profile_base_name(name, code)
         if not self._per_printer_profiles:
             async with async_session_maker() as db:
                 changed = await self._upsert_filament_bambu_slicer_setting_id(
@@ -3128,7 +3116,7 @@ class Driver(BaseDriver):
             raise ValueError("base_name or code is required")
         if code and not base_name:
             name = await self.resolve_preset_name(code)
-            base_name = _extract_profile_base_name(name or code)
+            base_name = coerce_profile_base_name(name, code)
         if not base_name:
             raise ValueError("Could not determine base_name")
 
@@ -3400,7 +3388,7 @@ class Driver(BaseDriver):
             raise ValueError("base_name or code is required")
         if code and not base_name:
             name = await self.resolve_preset_name(code)
-            base_name = _extract_profile_base_name(name or code)
+            base_name = coerce_profile_base_name(name, code)
         if not base_name:
             raise ValueError("Could not determine base_name")
 
@@ -3538,7 +3526,7 @@ class Driver(BaseDriver):
             raise ValueError("base_name or code is required")
         if code and not base_name:
             name = await self.resolve_preset_name(code)
-            base_name = _extract_profile_base_name(name or code)
+            base_name = coerce_profile_base_name(name, code)
         if not base_name:
             raise ValueError("Could not determine base_name")
 
@@ -3655,7 +3643,7 @@ class Driver(BaseDriver):
             raise ValueError("base_name or code is required")
         if code and not base_name:
             name = await self.resolve_preset_name(code)
-            base_name = _extract_profile_base_name(name or code)
+            base_name = coerce_profile_base_name(name, code)
         if not base_name:
             raise ValueError("Could not determine base_name")
 
@@ -3749,7 +3737,7 @@ class Driver(BaseDriver):
         if not spool_id or not code:
             raise ValueError("spool_id and code are required")
         name = await self.resolve_preset_name(code)
-        base_name = _extract_profile_base_name(name or code)
+        base_name = coerce_profile_base_name(name, code)
         if self._per_printer_profiles:
             return await self.set_default_spool_profile(
                 int(spool_id), base_name=base_name, code=code
@@ -3811,7 +3799,7 @@ class Driver(BaseDriver):
             raise ValueError("filament_id and code are required")
 
         name = await self.resolve_preset_name(code)
-        base_name = _extract_profile_base_name(name or code)
+        base_name = coerce_profile_base_name(name, code)
         if self._per_printer_profiles:
             return await self.set_default_filament_profile(
                 int(filament_id),
@@ -3848,7 +3836,7 @@ class Driver(BaseDriver):
                 )
                 spool_ids = [row[0] for row in result.all()]
             variant_map = fanout.get("variants") or {}
-            base_name = fanout.get("base_name") or _extract_profile_base_name(name or code)
+            base_name = fanout.get("base_name") or coerce_profile_base_name(name, code)
             for sid in spool_ids:
                 try:
                     if self._per_printer_profiles and variant_map:
@@ -4613,11 +4601,11 @@ class Driver(BaseDriver):
                 # Default base name: fill when empty only. Never let one model's
                 # inventory value continuously rewrite the spool default over an
                 # explicit override for another connected model.
-                if base_name:
+                if base_name and not is_cloud_setting_id(base_name):
                     current_default = await self._read_spool_default_base_name(
                         filaman_spool_id
                     )
-                    if not current_default:
+                    if not current_default or is_cloud_setting_id(current_default):
                         await self._upsert_spool_profile_base_name(
                             filaman_spool_id, base_name
                         )
