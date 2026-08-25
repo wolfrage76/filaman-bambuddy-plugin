@@ -1345,7 +1345,8 @@ class Driver(BaseDriver):
             n_pfus = sum(
                 1 for p in merged if str(p.get("code") or "").upper().startswith("PFUS")
             )
-            logger.info(
+            # WARNING so it always shows even when LOG_LEVEL=WARNING (common in Docker).
+            logger.warning(
                 f"Cloud preset catalog loaded: {len(merged)} total, "
                 f"{n_custom} custom, {n_pfus} PFUS "
                 f"(from Bambuddy {self._bambuddy_url})"
@@ -2268,8 +2269,21 @@ class Driver(BaseDriver):
 
         Optional ``model`` filters to one printer model; ``group=base`` dedupes by
         logical base name (nozzle suffix hidden from the picker).
+
+        ``catalog`` is always included so a logged-in browser can diagnose
+        stock-vs-custom without scraping Docker logs.
         """
-        presets = await self._load_cloud_presets(force=force)
+        raw = await self._load_cloud_presets(force=force)
+        n_custom = sum(1 for p in raw if p.get("isCustom"))
+        n_pfus = sum(
+            1 for p in raw if str(p.get("code") or "").upper().startswith("PFUS")
+        )
+        sample_custom = [
+            (p.get("name") or "")
+            for p in raw
+            if p.get("isCustom") and (p.get("name") or "")
+        ][:8]
+        presets: list[dict[str, Any]] = list(raw)
         if group == "base":
             presets = _group_presets_by_base_name(presets, model_token=model)
             if model:
@@ -2278,7 +2292,20 @@ class Driver(BaseDriver):
                 presets = _filter_grouped_presets_for_model(
                     presets, groups, model
                 )
-        return {"presets": presets, "count": len(presets)}
+        return {
+            "presets": presets,
+            "count": len(presets),
+            "catalog": {
+                "raw_total": len(raw),
+                "raw_custom": n_custom,
+                "raw_pfus": n_pfus,
+                "filtered_total": len(presets),
+                "filtered_custom": sum(1 for p in presets if p.get("isCustom")),
+                "model": (model or "").strip().upper() or None,
+                "group": group,
+                "sample_custom_names": sample_custom,
+            },
+        }
 
     async def resolve_preset_name(self, code: str | None) -> str | None:
         """Löst einen gespeicherten Code zum Anzeigenamen auf (wie Bambuddys Label).
