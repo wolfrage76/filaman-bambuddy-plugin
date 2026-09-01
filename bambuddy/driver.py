@@ -18,6 +18,7 @@ Flows:
 import asyncio
 import json
 import logging
+import os
 import pathlib
 import re
 import time
@@ -67,6 +68,14 @@ from .profile_variants import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The host app logs at WARNING unless its app-wide debug flag is on, which also
+# disables secure cookies and echoes SQL — too blunt to switch on just to read
+# the assign/sticky/learn trail after an AMS mix-up. Allow raising this driver's
+# level on its own instead.
+_DRIVER_LOG_LEVEL = os.environ.get("FILAMAN_BAMBUDDY_LOG_LEVEL", "").strip().upper()
+if _DRIVER_LOG_LEVEL:
+    logger.setLevel(getattr(logging, _DRIVER_LOG_LEVEL, logging.INFO))
 
 # Generische Bambu-Slicer-IDs für gängige Materialien (Fallback wenn kein bambu_idx gesetzt)
 _GENERIC_SLICER_IDS: dict[str, str] = {
