@@ -5327,8 +5327,10 @@ class Driver(BaseDriver):
             # callback can fire milliseconds AFTER this assign's configure and
             # revert the tray to the old spool's colour/profile. Verify and
             # re-push once if the tray no longer reflects what we sent.
-            if configure_error is None and self._slot_configure_gen_matches(
-                slot_key, assign_gen
+            if (
+                configure_error is None
+                and self._apply_to_printer
+                and self._slot_configure_gen_matches(slot_key, assign_gen)
             ):
                 _vt = asyncio.create_task(
                     self._verify_assign_configure(
