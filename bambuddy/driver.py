@@ -450,6 +450,8 @@ class Driver(BaseDriver):
         # -- Verbindungs-Status --
         self._ws_connected: bool = False  # WebSocket-Verbindung zu Bambuddy-Server
         self._printer_connected: bool = False  # Bambu-Drucker↔Bambuddy Verbindung
+        # Last Bambuddy printer status (WS printer_status or /status) for the Display API.
+        self._last_bambuddy_status: dict[str, Any] = {}
 
         # -- Status-Cache --
         self._current_slots: list[dict[str, Any]] = []
@@ -5040,6 +5042,7 @@ class Driver(BaseDriver):
             if event.get("printer_id") == self._bambuddy_printer_id:
                 old_connected = self._printer_connected
                 self._printer_connected = data.get("connected", self._printer_connected)
+                self._last_bambuddy_status = dict(data)
 
                 # Process slots (may emit slots_update if changed)
                 self._process_slots(data)
@@ -6056,11 +6059,18 @@ class Driver(BaseDriver):
         if not spool:
             return False
 
-        spool_tag = ""
-        if spool.rfid_uid:
-            spool_tag = self._to_hex_tag(spool.rfid_uid).upper().replace(":", "")
-        if tray_tag and spool_tag:
-            return tray_tag == spool_tag
+        # FilaMan spools may carry two chips (one per side, spools.rfid_uid_2);
+        # the AMS reports whichever side faces the reader, so accept either.
+        # getattr keeps this working against a FilaMan without the column.
+        spool_tags = {
+            self._to_hex_tag(uid)
+            for uid in (spool.rfid_uid, getattr(spool, "rfid_uid_2", None))
+            if uid
+        }
+        spool_tags.discard("")
+        spool_tag = next(iter(spool_tags), "")
+        if tray_tag and spool_tags:
+            return tray_tag in spool_tags
         # Bambu RFID uuid path when tag_uid absent
         if tray_uuid and spool_tag and len(tray_uuid) >= 16:
             # Can't reliably map uuid↔FilaMan rfid without Bambuddy; fall through
@@ -6755,6 +6765,7 @@ class Driver(BaseDriver):
                 status_data = r.json()
                 self.log_debug("in", f"GET {status_url}", status_data)
                 self._printer_connected = status_data.get("connected", False)
+                self._last_bambuddy_status = dict(status_data)
                 self._process_slots(status_data)
                 logger.info(
                     f"Initial status fetched for Bambuddy printer {self._bambuddy_printer_id} "
@@ -7277,6 +7288,20 @@ class Driver(BaseDriver):
         self.emit({"event_type": "slots_update", "slots": slots, "ams_info": ams_info})
 
     # -- Health ---------------------------------------------------------------
+
+    async def get_display_state(self) -> dict[str, Any] | None:
+        """Live state for FilaMan's Display API (GET /api/v1/display).
+
+        Returns the last Bambuddy printer status as received (WS
+        printer_status or the initial /status fetch); FilaMan's
+        display_service normalises it. Cached only — never hits Bambuddy.
+        """
+        status = self._last_bambuddy_status
+        if not status:
+            return {"connected": self._printer_connected, "ams": []}
+        out = dict(status)
+        out.setdefault("connected", self._printer_connected)
+        return out
 
     def health(self) -> dict[str, Any]:
         total_slots = sum(u.get("tray_count", 0) for u in self._current_ams_units)
