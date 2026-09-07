@@ -2077,9 +2077,14 @@ class Driver(BaseDriver):
                                 ctx["nozzle_mm"] = _float_or_none(status[key])
                             break
         except Exception as e:
-            logger.debug(f"Could not fetch printer context for Bambuddy id {bb_id}: {e}")
+            logger.warning(f"Could not fetch printer context for Bambuddy id {bb_id}: {e!r}")
 
-        self._printer_context_cache[bb_id] = ctx
+        # Only cache a resolved model. A failed or premature fetch (Bambuddy
+        # still starting, transient HTTP error) must not pin an empty model for
+        # the driver's lifetime — that hides the printer from the per-model
+        # profile UI ("No Bambu printer models connected") until restart.
+        if ctx.get("model"):
+            self._printer_context_cache[bb_id] = ctx
         return ctx
 
     def _peer_drivers(self) -> list["Driver"]:
