@@ -23,6 +23,9 @@ _CLOUD_PRESET_MODEL_RE = re.compile(
 
 _KNOWN_PRINTER_MODEL_TOKENS: tuple[str, ...] = (
     "P2S",
+    "H2DP",
+    "H2D",
+    "H2S",
     "H2C",
     "X1C",
     "X1",
