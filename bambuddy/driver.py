@@ -6786,7 +6786,15 @@ class Driver(BaseDriver):
         if tray.get("tray_type"):
             return True
         state = tray.get("state")
-        return state in (11, 12)
+        if state in (11, 12):
+            return True
+        # H2D/H2C firmware 01.04+ reports a spool whose filament has not been
+        # identified (the "?" slot on the printer screen) as a bare
+        # ``{"id", "state": 9}`` record with no tray_type at all. Bambuddy
+        # annotates every tray with ``exists`` from the printer's
+        # tray_exist_bits, which is the only reliable presence signal there.
+        # Treat such a tray as present so a pending scan can claim it.
+        return tray.get("exists") is True and state not in (0, 8)
 
     @staticmethod
     def _tray_snapshot(tray: dict) -> dict[str, Any]:
@@ -6964,7 +6972,7 @@ class Driver(BaseDriver):
                     None,
                 )
                 was_present = bool(prev_slot and prev_slot.get("present"))
-                now_present = bool(tray_type)
+                now_present = self._tray_is_loaded(tray)
                 sticky_fm_id = self._slot_to_filaman_spool.get(slot_index)
 
                 # Sticky assignments: physical empty does NOT clear FilaMan location
