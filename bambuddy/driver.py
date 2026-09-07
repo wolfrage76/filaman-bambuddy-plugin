@@ -480,6 +480,10 @@ class Driver(BaseDriver):
         # Per-slot generation: bumped on intentional assign/configure so a late
         # sticky MQTT for the previous occupant cannot overwrite the new one.
         self._slot_configure_gen: dict[str, int] = {}
+        # Slots with an in-flight pending/manual assign_or_configure. Late-NFC
+        # must not call _send_assignment(expected_gen=None) here — that bumps
+        # gen and aborts the assign's configure (and previously skipped location).
+        self._slot_configure_inflight: dict[str, int] = {}
         # Brief settle window so empty→reinsert / pending assign can bump gen
         # before a sticky reassert POSTs the old spool to Bambuddy.
         self._STICKY_REASSERT_SETTLE: float = 0.75
@@ -763,6 +767,7 @@ class Driver(BaseDriver):
         self._ws_connected = False
         self._printer_connected = False
         self._clear_pending()
+        self._slot_configure_inflight.clear()
         if self._client:
             await self._client.aclose()
             self._client = None
@@ -4826,13 +4831,22 @@ class Driver(BaseDriver):
             self._pending_poll_task.cancel()
 
         rfid_hex: str | None = None
-        try:
-            async with async_session_maker() as db:
-                spool = await db.get(Spool, spool_id)
-                if spool and spool.rfid_uid:
-                    rfid_hex = self._to_hex_tag(spool.rfid_uid)
-        except Exception as e:
-            logger.warning(f"Could not load rfid_uid for pending spool {spool_id}: {e}")
+        # Prefer UID from the weigh request (filament_data) so pending RFID match
+        # works when this weigh raced ahead of /rfid-result committing spools.rfid_uid.
+        raw_uid = filament_data.get("rfid_uid") or filament_data.get("tag_uuid")
+        if raw_uid:
+            try:
+                rfid_hex = self._to_hex_tag(str(raw_uid))
+            except Exception:
+                rfid_hex = None
+        if not rfid_hex:
+            try:
+                async with async_session_maker() as db:
+                    spool = await db.get(Spool, spool_id)
+                    if spool and spool.rfid_uid:
+                        rfid_hex = self._to_hex_tag(spool.rfid_uid)
+            except Exception as e:
+                logger.warning(f"Could not load rfid_uid for pending spool {spool_id}: {e}")
 
         self._pending_spool_id = spool_id
         self._pending_filament_data = {**filament_data, "id": spool_id}
@@ -4846,6 +4860,10 @@ class Driver(BaseDriver):
         self._pending_timer.add_done_callback(self._on_task_done)
         self._pending_poll_task = asyncio.create_task(self._pending_poll_loop())
         self._pending_poll_task.add_done_callback(self._on_task_done)
+        snap_present = {
+            k: bool(v.get("present"))
+            for k, v in (self._pending_slot_snapshot or {}).items()
+        }
         logger.info(
             f"Pending spool {spool_id} set for printer {self.printer_id} "
             f"(rfid={rfid_hex}, timeout={effective_timeout}s)"
@@ -5179,6 +5197,11 @@ class Driver(BaseDriver):
         noch nicht → Fallback auf den configure-Endpoint (alle Felder einzeln).
         Nach dem Sync ist bambuddy_spool_id via enrich_filament_data() verfügbar
         → einfacher Assignment-Call genügt (Bambuddy konfiguriert AMS automatisch).
+
+        FilaMan location is updated even when MQTT configure is skipped due to a
+        newer configure-gen (e.g. overlapping late-NFC). Location ownership and
+        printer tray MQTT are independent; aborting location on gen mismatch left
+        spools Opened with no AMS location after a successful pending match.
         """
         bambuddy_spool_id = _int_or_none(filament_data.get("bambuddy_spool_id"))
         filaman_spool_id = _int_or_none(filament_data.get("id"))
@@ -5189,120 +5212,138 @@ class Driver(BaseDriver):
         # from that reassert cannot overwrite this assign.
         self._cancel_sticky_task(slot_key)
         assign_gen = self._bump_slot_configure_gen(slot_key)
+        self._slot_configure_inflight[slot_key] = assign_gen
 
-        # -- Alte Spule aus Standort entfernen wenn Slot überschrieben wird --
-        old_filaman_spool_id = self._slot_to_filaman_spool.get(slot_key)
-        if old_filaman_spool_id and old_filaman_spool_id != filaman_spool_id:
-            # Slot SOFORT freigeben, damit der Restore-Task den Guard in
-            # _restore_spool_location() nicht als "noch aktiv" interpretiert
-            del self._slot_to_filaman_spool[slot_key]
-            # Drop the previous occupant's cached params. They exist to
-            # recover a PFUS for the *same* spool; carrying them across a
-            # swap lets a later rebuild (late-NFC, sticky) push the old
-            # spool's profile onto the new one.
-            self._slot_params_cache.pop(slot_key, None)
-            self._slot_last_sent.pop(slot_key, None)
-            _t = asyncio.create_task(self._restore_spool_location(old_filaman_spool_id))
-            _t.add_done_callback(self._on_task_done)
-            logger.info(
-                f"Removed old spool {old_filaman_spool_id} from slot {slot_key} "
-                f"(replaced by {filaman_spool_id})"
-            )
-
-        # -- Spoolman-Link: Vor Assignment alte Spoolman-Verknüpfung prüfen/entfernen --
-        if filaman_spool_id:
-            # Note: we intentionally do NOT record the spool's prior location as a
-            # "home" to restore to later. A spool that leaves a slot is set to *no*
-            # location (see _restore_spool_location). Remembering the prior location
-            # was buggy when that location was itself a slot (a spool moved slot→slot
-            # would be "restored" back into the stale slot instead of being freed).
-            # Spoolman-Linking nur wenn Inventory-Sync DEAKTIVIERT ist
-            # (Bei aktiviertem Sync nutzt Bambuddy sein eigenes Inventar, nicht Spoolman)
-            # Funktion selbst prüft zusätzlich _spoolman_enabled (defensive Programmierung)
-            if not self._sync_enabled:
+        configure_error: Exception | None = None
+        try:
+            # -- Alte Spule aus Standort entfernen wenn Slot überschrieben wird --
+            old_filaman_spool_id = self._slot_to_filaman_spool.get(slot_key)
+            if old_filaman_spool_id and old_filaman_spool_id != filaman_spool_id:
+                # Slot SOFORT freigeben, damit der Restore-Task den Guard in
+                # _restore_spool_location() nicht als "noch aktiv" interpretiert
+                del self._slot_to_filaman_spool[slot_key]
+                # Drop the previous occupant's cached params. They exist to
+                # recover a PFUS for the *same* spool; carrying them across a
+                # swap lets a later rebuild (late-NFC, sticky) push the old
+                # spool's profile onto the new one.
+                self._slot_params_cache.pop(slot_key, None)
+                self._slot_last_sent.pop(slot_key, None)
                 _t = asyncio.create_task(
-                    self._handle_spoolman_linking(ams_id, tray_id, filaman_spool_id)
+                    self._restore_spool_location(old_filaman_spool_id)
                 )
                 _t.add_done_callback(self._on_task_done)
-
-        # -- Delayed Refetch Helper --
-        async def _delayed_refetch():
-            await asyncio.sleep(3)
-            try:
-                await self._fetch_and_emit_status()
-            except Exception as e:
-                logger.warning(f"Delayed refetch after assignment failed: {e}")
-
-        # Inventory-Assignment (best-effort): registriert Bambuddy-interne Verknüpfung,
-        # steuert aber NICHT zuverlässig tray_info_idx — deshalb immer _send_assignment danach.
-        if bambuddy_spool_id and self._client and self._sync_enabled:
-            try:
-                response = await self._bb_post(
-                    "/api/v1/inventory/assignments",
-                    {
-                        "spool_id": bambuddy_spool_id,
-                        "printer_id": self._bambuddy_printer_id,
-                        "ams_id": ams_id,
-                        "tray_id": tray_id,
-                        "apply_to_printer": self._apply_to_printer,
-                    },
-                )
-                self.log_debug(
-                    "out",
-                    f"POST /api/v1/inventory/assignments",
-                    {
-                        "spool_id": bambuddy_spool_id,
-                        "printer_id": self._bambuddy_printer_id,
-                        "ams_id": ams_id,
-                        "tray_id": tray_id,
-                        "configured": response.get("configured"),
-                    },
-                )
                 logger.info(
-                    f"Assigned Bambuddy spool {bambuddy_spool_id} to "
-                    f"printer {self._bambuddy_printer_id} AMS {ams_id}/{tray_id} "
-                    f"(auto-configured={response.get('configured', False)})"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Assignment API failed (slot {ams_id}/{tray_id}), "
-                    f"continuing with configure-call: {e}"
+                    f"Removed old spool {old_filaman_spool_id} from slot {slot_key} "
+                    f"(replaced by {filaman_spool_id})"
                 )
 
-        # Immer configure-Call ausführen um tray_info_idx via MQTT zu setzen
-        if not self._slot_configure_gen_matches(slot_key, assign_gen):
-            logger.info(
-                f"Skip configure for AMS {ams_id}/{tray_id}: assign superseded "
-                f"before MQTT (gen {assign_gen})"
-            )
-            return
-        if self._apply_to_printer:
-            await self._send_assignment(
-                ams_id, tray_id, filament_data, expected_gen=assign_gen
-            )
+            # -- Spoolman-Link: Vor Assignment alte Spoolman-Verknüpfung prüfen/entfernen --
+            if filaman_spool_id:
+                # Note: we intentionally do NOT record the spool's prior location as a
+                # "home" to restore to later. A spool that leaves a slot is set to *no*
+                # location (see _restore_spool_location). Remembering the prior location
+                # was buggy when that location was itself a slot (a spool moved slot→slot
+                # would be "restored" back into the stale slot instead of being freed).
+                # Spoolman-Linking nur wenn Inventory-Sync DEAKTIVIERT ist
+                # (Bei aktiviertem Sync nutzt Bambuddy sein eigenes Inventar, nicht Spoolman)
+                # Funktion selbst prüft zusätzlich _spoolman_enabled (defensive Programmierung)
+                if not self._sync_enabled:
+                    _t = asyncio.create_task(
+                        self._handle_spoolman_linking(ams_id, tray_id, filaman_spool_id)
+                    )
+                    _t.add_done_callback(self._on_task_done)
 
-        if filaman_spool_id:
-            await self._update_spool_location(filaman_spool_id, ams_id, tray_id)
-            self._slot_to_filaman_spool[slot_key] = filaman_spool_id
+            # -- Delayed Refetch Helper --
+            async def _delayed_refetch():
+                await asyncio.sleep(3)
+                try:
+                    await self._fetch_and_emit_status()
+                except Exception as e:
+                    logger.warning(f"Delayed refetch after assignment failed: {e}")
 
-        _t = asyncio.create_task(_delayed_refetch())
-        _t.add_done_callback(self._on_task_done)
+            # Inventory-Assignment (best-effort): registriert Bambuddy-interne Verknüpfung,
+            # steuert aber NICHT zuverlässig tray_info_idx — deshalb immer _send_assignment danach.
+            if bambuddy_spool_id and self._client and self._sync_enabled:
+                try:
+                    response = await self._bb_post(
+                        "/api/v1/inventory/assignments",
+                        {
+                            "spool_id": bambuddy_spool_id,
+                            "printer_id": self._bambuddy_printer_id,
+                            "ams_id": ams_id,
+                            "tray_id": tray_id,
+                        },
+                    )
+                    self.log_debug(
+                        "out",
+                        f"POST /api/v1/inventory/assignments",
+                        {
+                            "spool_id": bambuddy_spool_id,
+                            "printer_id": self._bambuddy_printer_id,
+                            "ams_id": ams_id,
+                            "tray_id": tray_id,
+                            "configured": response.get("configured"),
+                        },
+                    )
+                    logger.info(
+                        f"Assigned Bambuddy spool {bambuddy_spool_id} to "
+                        f"printer {self._bambuddy_printer_id} AMS {ams_id}/{tray_id} "
+                        f"(auto-configured={response.get('configured', False)})"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Assignment API failed (slot {ams_id}/{tray_id}), "
+                        f"continuing with configure-call: {e}"
+                    )
 
-        # One-shot verification: Bambuddy arms a deferred "configure on
-        # insert" when an assignment is POSTed for an empty tray (sticky
-        # empty-reassert of the previous occupant does exactly that). That
-        # callback can fire milliseconds AFTER this assign's configure and
-        # revert the tray to the old spool's colour/profile. Verify and
-        # re-push once if the tray no longer reflects what we sent.
-        if self._apply_to_printer and self._slot_configure_gen_matches(
-            slot_key, assign_gen
-        ):
-            _vt = asyncio.create_task(
-                self._verify_assign_configure(
-                    ams_id, tray_id, dict(filament_data), assign_gen
+            # Configure MQTT when we still own the gen. Never skip FilaMan location
+            # solely because configure was superseded.
+            if self._slot_configure_gen_matches(slot_key, assign_gen):
+                try:
+                    await self._send_assignment(
+                        ams_id, tray_id, filament_data, expected_gen=assign_gen
+                    )
+                except Exception as e:
+                    configure_error = e
+            else:
+                logger.info(
+                    f"Skip configure for AMS {ams_id}/{tray_id}: assign superseded "
+                    f"before MQTT (gen {assign_gen}); still updating FilaMan location"
                 )
-            )
-            _vt.add_done_callback(self._on_task_done)
+
+            # Location if we still own the slot (or nobody else claimed it yet).
+            # Skip only when a newer assign already replaced us in the slot map.
+            owner = self._slot_to_filaman_spool.get(slot_key)
+            if filaman_spool_id and (owner is None or owner == filaman_spool_id):
+                await self._update_spool_location(filaman_spool_id, ams_id, tray_id)
+                self._slot_to_filaman_spool[slot_key] = filaman_spool_id
+
+            _t = asyncio.create_task(_delayed_refetch())
+            _t.add_done_callback(self._on_task_done)
+
+            # One-shot verification: Bambuddy arms a deferred "configure on
+            # insert" when an assignment is POSTed for an empty tray (sticky
+            # empty-reassert of the previous occupant does exactly that). That
+            # callback can fire milliseconds AFTER this assign's configure and
+            # revert the tray to the old spool's colour/profile. Verify and
+            # re-push once if the tray no longer reflects what we sent.
+            if (
+                configure_error is None
+                and self._apply_to_printer
+                and self._slot_configure_gen_matches(slot_key, assign_gen)
+            ):
+                _vt = asyncio.create_task(
+                    self._verify_assign_configure(
+                        ams_id, tray_id, dict(filament_data), assign_gen
+                    )
+                )
+                _vt.add_done_callback(self._on_task_done)
+
+            if configure_error is not None:
+                raise configure_error
+        finally:
+            if self._slot_configure_inflight.get(slot_key) == assign_gen:
+                self._slot_configure_inflight.pop(slot_key, None)
 
     async def _verify_assign_configure(
         self,
@@ -6316,6 +6357,13 @@ class Driver(BaseDriver):
         PLA/PETG slots that never lost their profile.
         """
         slot_key = f"{ams_id}-{tray_id}"
+        if slot_key in self._slot_configure_inflight:
+            logger.info(
+                f"Late NFC reconfigure skipped for slot {slot_key}: "
+                f"assign/configure in flight (would steal configure-gen)"
+            )
+            return
+
         cached = self._slot_params_cache.get(slot_key, {})
         fm_id = self._slot_to_filaman_spool.get(slot_key)
 
@@ -6857,6 +6905,12 @@ class Driver(BaseDriver):
         return False, ""
 
     def _fire_pending_assignment(self, ams_id: int, tray_id: int, reason: str) -> None:
+        slot_key = f"{ams_id}-{tray_id}"
+        # Mark before scheduling assign so same-turn late-NFC (empty→SUN*) cannot
+        # steal configure-gen via _send_assignment(expected_gen=None).
+        self._slot_configure_inflight[slot_key] = self._slot_configure_gen.get(
+            slot_key, 0
+        )
         logger.info(
             f"Pending spool {self._pending_spool_id} matched "
             f"AMS {ams_id}/{tray_id} ({reason})"
@@ -7042,16 +7096,23 @@ class Driver(BaseDriver):
                         (not prev_idx or prev_idx in _GENERIC_SLICER_ID_SET)
                         and tray_info_idx not in bambu_brand_codes
                     ):
-                        logger.info(
-                            f"Late NFC read on slot {slot_index}: "
-                            f"{prev_idx!r} → {tray_info_idx!r}, reconfiguring"
-                        )
-                        _t = asyncio.create_task(
-                            self._reconfigure_slot_with_profile(
-                                ams_id, tray_id, tray_info_idx, tray
+                        if slot_index in self._slot_configure_inflight:
+                            logger.info(
+                                f"Late NFC read on slot {slot_index}: "
+                                f"{prev_idx!r} → {tray_info_idx!r}, "
+                                f"skip reconfigure (assign in flight)"
                             )
-                        )
-                        _t.add_done_callback(self._on_task_done)
+                        else:
+                            logger.info(
+                                f"Late NFC read on slot {slot_index}: "
+                                f"{prev_idx!r} → {tray_info_idx!r}, reconfiguring"
+                            )
+                            _t = asyncio.create_task(
+                                self._reconfigure_slot_with_profile(
+                                    ams_id, tray_id, tray_info_idx, tray
+                                )
+                            )
+                            _t.add_done_callback(self._on_task_done)
                     elif (
                         (not prev_idx or prev_idx in _GENERIC_SLICER_ID_SET)
                         and tray_info_idx in bambu_brand_codes
@@ -7171,16 +7232,23 @@ class Driver(BaseDriver):
                     (not prev_vt_idx or prev_vt_idx in _GENERIC_SLICER_ID_SET)
                     and vt_tray_info_idx not in bambu_brand_codes
                 ):
-                    logger.info(
-                        f"Late NFC read on external tray {vt_idx}: "
-                        f"{prev_vt_idx!r} → {vt_tray_info_idx!r}, reconfiguring"
-                    )
-                    _t = asyncio.create_task(
-                        self._reconfigure_slot_with_profile(
-                            255, vt_tray_id, vt_tray_info_idx, vt
+                    if vt_idx in self._slot_configure_inflight:
+                        logger.info(
+                            f"Late NFC read on external tray {vt_idx}: "
+                            f"{prev_vt_idx!r} → {vt_tray_info_idx!r}, "
+                            f"skip reconfigure (assign in flight)"
                         )
-                    )
-                    _t.add_done_callback(self._on_task_done)
+                    else:
+                        logger.info(
+                            f"Late NFC read on external tray {vt_idx}: "
+                            f"{prev_vt_idx!r} → {vt_tray_info_idx!r}, reconfiguring"
+                        )
+                        _t = asyncio.create_task(
+                            self._reconfigure_slot_with_profile(
+                                255, vt_id, vt_tray_info_idx, vt
+                            )
+                        )
+                        _t.add_done_callback(self._on_task_done)
                 elif (
                     (not prev_vt_idx or prev_vt_idx in _GENERIC_SLICER_ID_SET)
                     and vt_tray_info_idx in bambu_brand_codes
