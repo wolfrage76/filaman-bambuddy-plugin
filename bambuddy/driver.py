@@ -7748,6 +7748,30 @@ class Driver(BaseDriver):
             return True, "direct-swap"
         return False, ""
 
+    def _note_pending_slot_empty(self, slot_index: str) -> None:
+        """Mark a bay empty so the next spool in it completes the pending scan."""
+        snap = self._pending_slot_snapshot
+        if snap is None:
+            snap = {}
+            self._pending_slot_snapshot = snap
+        entry = snap.get(slot_index)
+        if entry is not None and not entry.get("present", False):
+            return
+        if entry is None:
+            snap[slot_index] = {
+                "present": False,
+                "tray_type": "",
+                "tray_color": "",
+                "state": None,
+                "tag_uid": "",
+            }
+        else:
+            entry["present"] = False
+        logger.info(
+            f"Pending spool {self._pending_spool_id} on printer {self.printer_id}: "
+            f"slot {slot_index} went empty"
+        )
+
     def _fire_pending_assignment(self, ams_id: int, tray_id: int, reason: str) -> None:
         slot_key = f"{ams_id}-{tray_id}"
         # Mark before scheduling assign so same-turn late-NFC (empty→SUN*) cannot
@@ -7840,6 +7864,11 @@ class Driver(BaseDriver):
                 # Never reassert while a pending RFID scan is active (swap race:
                 # old occupant SUN*/GF* MQTT was overwriting the new assign).
                 if not now_present:
+                    # A bay emptied after the scan is where the scanned spool
+                    # goes next, even when the printer still advertises the
+                    # old profile once the new spool is in.
+                    if self._pending_spool_id is not None:
+                        self._note_pending_slot_empty(slot_index)
                     if (
                         sticky_fm_id
                         and was_present
@@ -8029,6 +8058,8 @@ class Driver(BaseDriver):
             sticky_vt_id = self._slot_to_filaman_spool.get(vt_idx)
 
             if not vt_now_present:
+                if self._pending_spool_id is not None:
+                    self._note_pending_slot_empty(vt_idx)
                 if (
                     sticky_vt_id
                     and vt_was_present
