@@ -5811,6 +5811,12 @@ class Driver(BaseDriver):
         """
         bambuddy_spool_id = _int_or_none(filament_data.get("bambuddy_spool_id"))
         filaman_spool_id = _int_or_none(filament_data.get("id"))
+        # filament_data may be a stale snapshot taken when the scale armed
+        # auto-assign, before the debounced sync created the Bambuddy spool.
+        if not bambuddy_spool_id and filaman_spool_id:
+            bambuddy_spool_id = await self._get_bambuddy_spool_id(filaman_spool_id)
+            if bambuddy_spool_id:
+                filament_data = {**filament_data, "bambuddy_spool_id": bambuddy_spool_id}
         slot_key = f"{ams_id}-{tray_id}"
 
         # Win the slot immediately: cancel any sticky reassert of the previous
