@@ -316,6 +316,76 @@ def _int_or_none(v: Any) -> int | None:
         return None
 
 
+# Last-resort nozzle range when neither printer_params nor a same-material
+# live tray has temperatures. PLA stays at the historical 190–230 fallback.
+# Other families must not inherit that PLA range.
+_NOZZLE_TEMP_DEFAULTS: dict[str, tuple[int, int]] = {
+    "PLA": (190, 230),
+    "PETG": (220, 250),
+    "ABS": (230, 270),
+    "ASA": (240, 270),
+    "TPU": (220, 250),
+    "TPE": (220, 250),
+    "PA": (240, 280),
+    "PC": (260, 300),
+    "HIPS": (220, 250),
+    "PVA": (170, 200),
+}
+_DEFAULT_NOZZLE_TEMP = (190, 230)
+
+
+def _nozzle_temp_defaults(material: str | None) -> tuple[int, int]:
+    family = normalize_material_family(material) or "PLA"
+    return _NOZZLE_TEMP_DEFAULTS.get(family, _DEFAULT_NOZZLE_TEMP)
+
+
+def resolve_nozzle_temps(
+    filament_data: dict[str, Any],
+    material: str | None,
+    live_slot: dict[str, Any] | None,
+) -> tuple[int, int, bool]:
+    """Pick nozzle min/max for an AMS configure.
+
+    Stored printer params win. A missing side may be copied from the live tray
+    only when that tray is the same material family (a swap can still be
+    reporting the previous spool). Anything still missing uses the material
+    default. The bool is True when a live tray temperature was copied.
+    """
+    nozzle_temp_min = _int_or_none(
+        filament_data.get("bambu_nozzle_temp_min")
+    ) or _int_or_none(filament_data.get("nozzle_temp_min"))
+    nozzle_temp_max = _int_or_none(
+        filament_data.get("bambu_nozzle_temp_max")
+    ) or _int_or_none(filament_data.get("nozzle_temp_max"))
+
+    used_live = False
+    if nozzle_temp_min is None or nozzle_temp_max is None:
+        slot = live_slot
+        if slot and (
+            normalize_material_family(slot.get("tray_type"))
+            != normalize_material_family(material)
+        ):
+            slot = None
+        if slot:
+            if nozzle_temp_min is None:
+                copied = _int_or_none(slot.get("nozzle_temp_min"))
+                if copied is not None:
+                    nozzle_temp_min = copied
+                    used_live = True
+            if nozzle_temp_max is None:
+                copied = _int_or_none(slot.get("nozzle_temp_max"))
+                if copied is not None:
+                    nozzle_temp_max = copied
+                    used_live = True
+
+    default_min, default_max = _nozzle_temp_defaults(material)
+    if nozzle_temp_min is None:
+        nozzle_temp_min = default_min
+    if nozzle_temp_max is None:
+        nozzle_temp_max = default_max
+    return nozzle_temp_min, nozzle_temp_max, used_live
+
+
 def _float_or_none(v: Any) -> float | None:
     """Konvertiert einen Wert zu float, gibt None zurück bei leerem/ungültigem Wert."""
     try:
@@ -2872,6 +2942,109 @@ class Driver(BaseDriver):
             )
         return {"reconfigured": count}
 
+    def _currently_printing(self) -> bool:
+        status = self._last_bambuddy_status or {}
+        return self._is_printing(self._parse_print_state(status))
+
+    async def _occupied_spool_ids_for_filament(self, filament_id: int) -> set[int]:
+        """FilaMan spool ids of this filament that a peer currently has loaded."""
+        occupied: set[int] = set()
+        for peer in self._peer_drivers():
+            occupied.update(
+                int(sid) for sid in peer._slot_to_filaman_spool.values() if sid
+            )
+        if not occupied or not filament_id:
+            return set()
+        try:
+            async with async_session_maker() as db:
+                result = await db.execute(
+                    select(Spool.id).where(
+                        Spool.id.in_(occupied),
+                        Spool.filament_id == int(filament_id),
+                    )
+                )
+                return {int(row[0]) for row in result.all()}
+        except Exception as e:
+            logger.warning(
+                f"Could not resolve occupied spools for filament {filament_id}: {e}"
+            )
+            return set()
+
+    async def _reconfigure_own_slots_holding(
+        self, spool_ids: set[int], *, reason: str
+    ) -> int:
+        matches = [
+            (slot_key, int(spool_id))
+            for slot_key, spool_id in list(self._slot_to_filaman_spool.items())
+            if int(spool_id) in spool_ids
+        ]
+        if not matches:
+            return 0
+        if self._currently_printing():
+            self._pending_reconfigure_after_print = True
+            logger.info(
+                f"Profile change ({reason}) on printer {self.printer_id} during "
+                f"print; deferring slot reconfigure until idle"
+            )
+            return 0
+        count = 0
+        for slot_key, spool_id in matches:
+            parts = slot_key.split("-", 1)
+            if len(parts) != 2:
+                continue
+            slot_ams, slot_tray = int(parts[0]), int(parts[1])
+            filament_data = await self._filament_data_for_spool(spool_id)
+            await self._send_assignment(slot_ams, slot_tray, filament_data)
+            count += 1
+        if count:
+            logger.info(
+                f"Reconfigured {count} slot(s) on printer {self.printer_id} "
+                f"after {reason}"
+            )
+        return count
+
+    async def _reconfigure_slots_holding_spools(
+        self, spool_ids: set[int] | list[int], *, reason: str
+    ) -> int:
+        """Push the current profile to AMS slots that hold these spools.
+
+        Profile edits update FilaMan and Bambuddy inventory only. A slot that
+        already holds the spool keeps its previous configure until this runs.
+        A printer that is printing defers until idle, using the same flag as
+        a nozzle-change reconfigure.
+        """
+        wanted = {int(sid) for sid in spool_ids if sid}
+        if not wanted:
+            return 0
+        total = 0
+        for peer in self._peer_drivers():
+            try:
+                total += await peer._reconfigure_own_slots_holding(
+                    wanted, reason=reason
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Slot reconfigure after {reason} failed on printer "
+                    f"{getattr(peer, 'printer_id', '?')}: {e}"
+                )
+        return total
+
+    async def _refresh_assigned_slots_for_profile(
+        self,
+        *,
+        spool_id: int | None = None,
+        filament_id: int | None = None,
+    ) -> None:
+        if spool_id:
+            await self._reconfigure_slots_holding_spools(
+                [int(spool_id)], reason="spool_profile"
+            )
+        elif filament_id:
+            await self._reconfigure_slots_holding_spools(
+                await self._occupied_spool_ids_for_filament(int(filament_id)),
+                reason="filament_profile",
+            )
+
     @staticmethod
     def _parse_print_state(status_data: dict[str, Any]) -> str:
         for key in ("gcode_state", "print_state", "state", "job_state"):
@@ -3798,6 +3971,7 @@ class Driver(BaseDriver):
             int(spool_id), variants_by_model
         )
         await self._push_linked_model_presets(int(spool_id))
+        await self._refresh_assigned_slots_for_profile(spool_id=int(spool_id))
 
         return {
             "spool_id": int(spool_id),
@@ -4095,6 +4269,8 @@ class Driver(BaseDriver):
         else:
             await self._debounced_sync()
 
+        await self._refresh_assigned_slots_for_profile(filament_id=int(filament_id))
+
         return {
             "filament_id": int(filament_id),
             "base_name": base_name,
@@ -4159,6 +4335,7 @@ class Driver(BaseDriver):
                 filament_id=filament_id,
             )
             await self._push_linked_model_presets(int(spool_id))
+            await self._refresh_assigned_slots_for_profile(spool_id=int(spool_id))
             return {
                 "spool_id": int(spool_id),
                 "model": model_key,
@@ -4222,6 +4399,7 @@ class Driver(BaseDriver):
         )
         await self._push_linked_model_presets(int(spool_id))
         await self._debounced_sync()
+        await self._refresh_assigned_slots_for_profile(spool_id=int(spool_id))
 
         return {
             "spool_id": int(spool_id),
@@ -4276,6 +4454,9 @@ class Driver(BaseDriver):
             )
             coverage = await self._resolve_model_coverage_map(
                 profiles, filament_id=int(filament_id)
+            )
+            await self._refresh_assigned_slots_for_profile(
+                filament_id=int(filament_id)
             )
             return {
                 "filament_id": int(filament_id),
@@ -4367,6 +4548,8 @@ class Driver(BaseDriver):
         else:
             await self._debounced_sync()
 
+        await self._refresh_assigned_slots_for_profile(filament_id=int(filament_id))
+
         return {
             "filament_id": int(filament_id),
             "model": model_key,
@@ -4427,6 +4610,7 @@ class Driver(BaseDriver):
             f"set_spool_profile: FilaMan spool {spool_id} → {code!r} "
             f"({name or 'unknown name'})"
         )
+        await self._refresh_assigned_slots_for_profile(spool_id=int(spool_id))
         return {
             "code": code,
             "name": name,
@@ -4509,6 +4693,9 @@ class Driver(BaseDriver):
                     )
         else:
             await self._debounced_sync()
+            await self._refresh_assigned_slots_for_profile(
+                filament_id=int(filament_id)
+            )
 
         logger.info(
             f"set_filament_profile: filament {filament_id} → {code!r} "
@@ -6379,38 +6566,20 @@ class Driver(BaseDriver):
             )
 
         # -- Temperaturen --
-        nozzle_temp_min = _int_or_none(
-            filament_data.get("bambu_nozzle_temp_min")
-        ) or _int_or_none(filament_data.get("nozzle_temp_min"))
-        nozzle_temp_max = _int_or_none(
-            filament_data.get("bambu_nozzle_temp_max")
-        ) or _int_or_none(filament_data.get("nozzle_temp_max"))
-        if nozzle_temp_min is None or nozzle_temp_max is None:
-            live_slot = next(
-                (
-                    s
-                    for s in self._current_slots
-                    if s.get("slot_index") == slot_key
-                ),
-                None,
+        # Stored bambu_nozzle_temp_* / nozzle_temp_* win. Otherwise keep the
+        # live tray range when it is the same material, else the material default.
+        live_slot = next(
+            (s for s in self._current_slots if s.get("slot_index") == slot_key),
+            None,
+        )
+        nozzle_temp_min, nozzle_temp_max, used_live_temps = resolve_nozzle_temps(
+            filament_data, material, live_slot
+        )
+        if used_live_temps:
+            logger.info(
+                f"Keeping live nozzle temps {nozzle_temp_min}-{nozzle_temp_max} "
+                f"for slot {ams_id}/{tray_id}"
             )
-            # Only reuse temps the tray already has for this material family.
-            # After a swap the AMS can still report the previous spool's temps.
-            if live_slot and (
-                normalize_material_family(live_slot.get("tray_type"))
-                != normalize_material_family(material)
-            ):
-                live_slot = None
-            if live_slot:
-                if nozzle_temp_min is None:
-                    nozzle_temp_min = _int_or_none(live_slot.get("nozzle_temp_min"))
-                if nozzle_temp_max is None:
-                    nozzle_temp_max = _int_or_none(live_slot.get("nozzle_temp_max"))
-            if nozzle_temp_min is not None or nozzle_temp_max is not None:
-                logger.info(
-                    f"Keeping live nozzle temps {nozzle_temp_min}-{nozzle_temp_max} "
-                    f"for slot {ams_id}/{tray_id} (FilaMan has none stored)"
-                )
 
         # k_value für configure-Endpoint — 0.0 = skip (kein K-Profil setzen)
         k_value = _float_or_none(filament_data.get("bambu_k_value")) or 0.0
@@ -6425,8 +6594,8 @@ class Driver(BaseDriver):
             "tray_type": material,
             "tray_sub_brands": tray_sub_brands,
             "tray_color": color,  # 8-stellig RRGGBBAA
-            "nozzle_temp_min": nozzle_temp_min or 190,  # REQUIRED — Fallback 190°C
-            "nozzle_temp_max": nozzle_temp_max or 230,  # REQUIRED — Fallback 230°C
+            "nozzle_temp_min": nozzle_temp_min,
+            "nozzle_temp_max": nozzle_temp_max,
             "cali_idx": cali_idx,
             "setting_id": setting_id,
             "kprofile_filament_id": slicer_filament,
